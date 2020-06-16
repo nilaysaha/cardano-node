@@ -91,7 +91,7 @@ module Cardano.Api.Typed (
     makeByronTransaction,
     makeShelleyTransaction,
     SlotNo,
-    TxOptional(..),
+    TxExtraContent(..),
 
     -- * Signing transactions
     -- | Creating transaction witnesses one by one, or all in one go.
@@ -222,8 +222,10 @@ import Prelude
 import           Data.Proxy (Proxy(..))
 import           Data.Kind (Constraint)
 import           Data.Maybe
+import           Data.Either
 import           Data.Bifunctor (first)
 import           Data.List as List
+import qualified Data.List.NonEmpty as NonEmpty
 --import           Data.Either
 import           Data.String (IsString(fromString))
 import           Numeric.Natural
@@ -232,6 +234,11 @@ import           Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.ByteString.Base16 as Base16
+
+import qualified Data.Set as Set
+import qualified Data.Map.Strict as Map
+import qualified Data.Sequence.Strict as Seq
+import qualified Data.Vector as Vector
 
 --import Control.Monad
 --import Control.Monad.IO.Class
@@ -267,21 +274,25 @@ import qualified Cardano.Crypto.VRF.Class   as Crypto
 --
 import qualified Cardano.Crypto.Hashing as Byron
 import qualified Cardano.Crypto.Signing as Byron
+import qualified Cardano.Crypto.ProtocolMagic as Byron
 import qualified Cardano.Chain.Common as Byron
+import qualified Cardano.Chain.Genesis as Byron
 import qualified Cardano.Chain.UTxO   as Byron
 
 --
 -- Shelley imports
 --
 import qualified Ouroboros.Consensus.Shelley.Protocol.Crypto as Shelley
+
 import qualified Shelley.Spec.Ledger.Address                 as Shelley
 import qualified Shelley.Spec.Ledger.Credential              as Shelley
 import qualified Shelley.Spec.Ledger.BaseTypes               as Shelley
---import qualified Shelley.Spec.Ledger.Coin                    as Shelley
+import qualified Shelley.Spec.Ledger.Coin                    as Shelley
 --import qualified Shelley.Spec.Ledger.Delegation.Certificates as Shelley
 import qualified Shelley.Spec.Ledger.Keys                    as Shelley
 import qualified Shelley.Spec.Ledger.PParams                 as Shelley
 import qualified Shelley.Spec.Ledger.OCert                   as Shelley
+import qualified Shelley.Spec.Ledger.PParams                 as Shelley
 import qualified Shelley.Spec.Ledger.Scripts                 as Shelley
 import qualified Shelley.Spec.Ledger.TxData                  as Shelley
 import qualified Shelley.Spec.Ledger.Tx                      as Shelley
@@ -528,6 +539,10 @@ makeStakeAddress nw sc =
       (toShelleyStakeCredential sc)
 
 
+toByronProtocolMagicId :: NetworkId -> Byron.ProtocolMagicId
+toByronProtocolMagicId Mainnet = Byron.mainnetProtocolMagicId
+toByronProtocolMagicId (Testnet (NetworkMagic pm)) = Byron.ProtocolMagicId pm
+
 toByronNetworkMagic :: NetworkId -> Byron.NetworkMagic
 toByronNetworkMagic Mainnet                     = Byron.NetworkMainOrStage
 toByronNetworkMagic (Testnet (NetworkMagic nm)) = Byron.NetworkTestnet nm
@@ -536,6 +551,9 @@ toShelleyNetwork :: NetworkId -> Shelley.Network
 toShelleyNetwork  Mainnet    = Shelley.Mainnet
 toShelleyNetwork (Testnet _) = Shelley.Testnet
 
+toShelleyAddr :: Address era -> Shelley.Addr ShelleyCrypto
+toShelleyAddr (ByronAddress addr)        = Shelley.AddrBootstrap addr
+toShelleyAddr (ShelleyAddress nw pc scr) = Shelley.Addr nw pc scr
 
 toShelleyPaymentCredential :: PaymentCredential
                            -> Shelley.PaymentCredential ShelleyCrypto
@@ -576,6 +594,14 @@ instance SerialiseAsRawBytes TxId where
     serialiseToRawBytes (TxId h) = Crypto.getHash h
     deserialiseFromRawBytes AsTxId bs = TxId <$> Crypto.hashFromBytes bs
 
+toByronTxId :: TxId -> Byron.TxId
+toByronTxId (TxId (Crypto.UnsafeHash h)) =
+    Byron.unsafeHashFromBytes h
+
+toShelleyTxId :: TxId -> Shelley.TxId ShelleyCrypto
+toShelleyTxId (TxId h) =
+    Shelley.TxId (Crypto.castHash h)
+
 -- | Calculate the transaction identifier for a 'TxBody'.
 --
 getTxId :: TxBody era -> TxId
@@ -610,6 +636,32 @@ data TxOut era = TxOut (Address era) Lovelace
 
 newtype Lovelace = Lovelace Integer
   deriving (Eq, Ord, Enum, Show)
+
+
+toByronTxIn  :: TxIn -> Byron.TxIn
+toByronTxIn (TxIn txid (TxIx txix)) =
+    Byron.TxInUtxo (toByronTxId txid) (fromIntegral txix)
+
+toByronTxOut :: TxOut Byron -> Maybe Byron.TxOut
+toByronTxOut (TxOut (ByronAddress addr) value) =
+    Byron.TxOut addr <$> toByronLovelace value
+
+toByronLovelace :: Lovelace -> Maybe Byron.Lovelace
+toByronLovelace (Lovelace x) =
+    case Byron.integerToLovelace x of
+      Left  _  -> Nothing
+      Right x' -> Just x'
+
+toShelleyTxIn  :: TxIn -> Shelley.TxIn ShelleyCrypto
+toShelleyTxIn (TxIn txid (TxIx txix)) =
+    Shelley.TxIn (toShelleyTxId txid) (fromIntegral txix)
+
+toShelleyTxOut :: TxOut era -> Shelley.TxOut ShelleyCrypto
+toShelleyTxOut (TxOut addr value) =
+    Shelley.TxOut (toShelleyAddr addr) (toShelleyLovelace value)
+
+toShelleyLovelace :: Lovelace -> Shelley.Coin
+toShelleyLovelace (Lovelace l) = Shelley.Coin l
 
 
 -- ----------------------------------------------------------------------------
@@ -658,11 +710,27 @@ instance HasTextEnvelope (TxBody Shelley) where
     textEnvelopeType _ = "TxUnsignedShelley"
 
 
-makeByronTransaction :: [TxIn] -> [TxOut Byron] -> TxBody Byron
-makeByronTransaction = undefined
+data ByronTxBodyConversionError =
+       ByronTxBodyEmptyTxIns
+     | ByronTxBodyEmptyTxOuts
+     | ByronTxBodyLovelaceOverflow
 
-data TxOptional =
-     TxOptional {
+makeByronTransaction :: [TxIn] -> [TxOut Byron]
+                     -> Either ByronTxBodyConversionError
+                               (TxBody Byron)
+makeByronTransaction ins outs = do
+    ins'  <- NonEmpty.nonEmpty ins        ?! ByronTxBodyEmptyTxIns
+    let ins'' = NonEmpty.map toByronTxIn ins'
+
+    outs'  <- NonEmpty.nonEmpty outs      ?! ByronTxBodyEmptyTxOuts
+    outs'' <- traverse toByronTxOut outs' ?! ByronTxBodyLovelaceOverflow
+    return $
+      ByronTxBody $
+        Byron.UnsafeTx ins'' outs'' (Byron.mkAttributes ())
+
+
+data TxExtraContent =
+     TxExtraContent {
        txMetadata        :: Maybe TxMetadata,
        txWithdrawals     :: [(StakeAddress, Lovelace)],
        txCertificates    :: [Certificate],
@@ -673,13 +741,49 @@ data TxMetadata
 data Certificate
 type ProtocolUpdates = Shelley.ProposedPPUpdates ShelleyCrypto
 
-makeShelleyTransaction :: TxOptional
-                       -> SlotNo
-                       -> Lovelace
+type TxFee = Lovelace
+type TTL   = SlotNo
+
+
+makeShelleyTransaction :: TxExtraContent
+                       -> TTL
+                       -> TxFee
                        -> [TxIn]
                        -> [TxOut anyera]
                        -> TxBody Shelley
-makeShelleyTransaction = undefined
+makeShelleyTransaction TxExtraContent {
+                         txMetadata = _,
+                         txWithdrawals = _,
+                         txCertificates = _,
+                         txProtocolUpdates = _
+                       } ttl fee ins outs =
+    ShelleyTxBody
+      (Shelley.TxBody
+        (Set.fromList (map toShelleyTxIn ins))
+        (Seq.fromList (map toShelleyTxOut outs))
+        Seq.empty -- (Seq.fromList (map toShelleyCertificate txCertificates))
+        (Shelley.Wdrl Map.empty)  -- (toShelleyWdrl txWithdrawals)
+        (toShelleyLovelace fee)
+        ttl
+        Shelley.SNothing -- (toShelleyUpdate <$> Shelley.maybeToStrictMaybe txProtocolUpdates)
+        Shelley.SNothing) -- (toShelleyMetaDataHash <$> Shelley.maybeToStrictMaybe txMetadata))
+{-
+  where
+    toShelleyCertificate :: Certificate -> Shelley.DCert ShelleyCrypto
+    toShelleyCertificate = undefined
+
+    toShelleyWdrl :: [(StakeAddress, Lovelace)] -> Shelley.Wdrl ShelleyCrypto
+    toShelleyWdrl = undefined
+
+    toShelleyUpdate :: ProtocolUpdates -> Shelley.Update ShelleyCrypto
+    toShelleyUpdate = undefined
+
+    toShelleyMetaDataHash :: TxMetadata -> Shelley.MetaDataHash ShelleyCrypto
+    toShelleyMetaDataHash = undefined
+
+    toShelleyMetaData :: TxMetadata -> Shelley.MetaData
+    toShelleyMetaData = undefined
+-}
 
 
 -- ----------------------------------------------------------------------------
@@ -801,12 +905,44 @@ getTxWitnesses (ShelleyTx _tx) = undefined
 makeSignedTransaction :: [Witness era]
                       -> TxBody era
                       -> Tx era
-makeSignedTransaction = undefined
+makeSignedTransaction witnesses (ByronTxBody txbody) =
+    ByronTx $
+      Byron.mkTxAux
+        txbody
+        (Vector.fromList (map selectByronWitness witnesses))
+  where
+    selectByronWitness :: Witness Byron -> Byron.TxInWitness
+    selectByronWitness (ByronKeyWitness w) = w
+
+makeSignedTransaction witnesses (ShelleyTxBody txbody) =
+    ShelleyTx $
+      Shelley.Tx
+        txbody
+        (Set.fromList keyWits)
+        (Map.fromList [ (Shelley.hashScript sw, sw)
+                      | sw <- scriptWits ])
+        Shelley.SNothing -- (Shelley.maybeToStrictMaybe txmetadata)
+  where
+    (keyWits, scriptWits) = partitionEithers (map selectShelleyWitness witnesses)
+
+    selectShelleyWitness :: Witness Shelley
+                         -> Either (Shelley.WitVKey ShelleyCrypto)
+                                   (Shelley.MultiSig ShelleyCrypto)
+    selectShelleyWitness (ShelleyKeyWitness    w) = Left w
+    selectShelleyWitness (ShelleyScriptWitness w) = Right w
 
 
 byronKeyWitness :: NetworkId -> SigningKey ByronKey -> TxBody era -> Witness Byron
-byronKeyWitness = undefined
-
+byronKeyWitness nw (ByronSigningKey _sk) _txbody = undefined
+{-
+    ByronKeyWitness $
+      Byron.VKWitness
+        (Byron.toVerification sk)
+        (Byron.sign pm Byron.SignTx sk (Byron.TxSigData txHash))
+-}
+  where
+--    txHash = undefined
+    _pm = toByronProtocolMagicId nw
 
 shelleyKeyWitness :: SigningKey keyrole -> TxBody era -> Witness Shelley
 shelleyKeyWitness = undefined
@@ -817,10 +953,6 @@ shelleyKeyWitness = undefined
 --  StakeKey     -- for stake addr withdrawals and retiring and pool owners
 --  StakePoolKey -- for stake pool ops
 --  GenesisDelegateKey -- for update proposals, MIR etc
-
-
-shelleyScriptWitness :: Script -> TxId -> Witness Shelley
-shelleyScriptWitness = undefined
 
 
 -- order of signing keys must match txins
@@ -844,6 +976,11 @@ signShelleyTransaction = undefined
 data Script
 
 newtype instance Hash Script = ScriptHash (Shelley.ScriptHash ShelleyCrypto)
+
+
+shelleyScriptWitness :: Script -> TxId -> Witness Shelley
+shelleyScriptWitness = undefined
+
 
 -- ----------------------------------------------------------------------------
 -- Operational certificates
@@ -1748,3 +1885,13 @@ instance HasTextEnvelope (SigningKey VrfKey) where
       where
         proxy :: Proxy (Shelley.VRF ShelleyCrypto)
         proxy = Proxy
+
+
+--
+-- Utils
+--
+
+(?!) :: Maybe a -> e -> Either e a
+Nothing ?! e = Left e
+Just x  ?! _ = Right x
+
