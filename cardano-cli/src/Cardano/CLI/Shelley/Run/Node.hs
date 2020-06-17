@@ -18,7 +18,8 @@ import           Cardano.Api.Typed (AsType (..), Error (..), FileError,
                    issueOperationalCertificate, readFileTextEnvelope,
                    writeFileTextEnvelope)
 
-import           Cardano.Config.TextView (TextViewTitle (..))
+import           Cardano.Config.Shelley.OCert
+import           Cardano.Config.TextView (TextViewTitle (..), textShow)
 import           Cardano.Config.Types (SigningKeyFile(..))
 
 import           Cardano.CLI.Shelley.Commands
@@ -28,6 +29,8 @@ data ShelleyNodeCmdError
   = ShelleyNodeReadFileError !(FileError TextEnvelopeError)
   | ShelleyNodeWriteFileError !(FileError ())
   | ShelleyNodeOperationalCertificateIssueError !OperationalCertIssueError
+  | ShelleyNodeReadOperationalCertCounterError !FilePath !OperationalCertError
+  | ShelleyNodeWriteOpCertIssueCounterError !FilePath !OperationalCertError
   deriving Show
 
 renderShelleyNodeCmdError :: ShelleyNodeCmdError -> Text
@@ -39,6 +42,12 @@ renderShelleyNodeCmdError err =
 
     ShelleyNodeOperationalCertificateIssueError issueErr ->
       Text.pack (displayError issueErr)
+
+    ShelleyNodeReadOperationalCertCounterError fp opCertErr ->
+      "Error reading the operational certificate issue counter at: " <> textShow fp <> " Error: " <> renderOperationalCertError opCertErr
+
+    ShelleyNodeWriteOpCertIssueCounterError fp opCertErr ->
+      "Error writing the operational certificate issue counter at: " <> textShow fp <> " Error: " <> renderOperationalCertError opCertErr
 
 
 runNodeCmd :: NodeCmd -> ExceptT ShelleyNodeCmdError IO ()
@@ -68,15 +77,12 @@ runNodeKeyGenCold (VerificationKeyFile vkeyPath) (SigningKeyFile skeyPath)
     firstExceptT ShelleyNodeWriteFileError
       . newExceptT
       $ writeFileTextEnvelope vkeyPath (Just vkeyDesc) vkey
-    firstExceptT ShelleyNodeWriteFileError
-      . newExceptT
-      $ writeFileTextEnvelope ocertCtrPath (Just ocertCtrDesc)
-      $ OperationalCertificateIssueCounter initialCounter vkey
+    firstExceptT (ShelleyNodeWriteOpCertIssueCounterError ocertCtrPath) $
+      writeOperationalCertIssueCounter ocertCtrPath initialCounter
   where
-    skeyDesc, vkeyDesc, ocertCtrDesc :: TextViewTitle
+    skeyDesc, vkeyDesc :: TextViewTitle
     skeyDesc = TextViewTitle "Stake Pool Operator Signing Key"
     vkeyDesc = TextViewTitle "Stake Pool Operator Verification Key"
-    ocertCtrDesc = TextViewTitle $ "Next certificate issue number: " <> show initialCounter
 
     initialCounter :: Natural
     initialCounter = 0
@@ -132,10 +138,8 @@ runNodeIssueOpCert (VerificationKeyFile vkeyKesPath)
                    (OpCertCounterFile ocertCtrPath)
                    kesPeriod
                    (OutputFile certFile) = do
-
-    ocertIssueCounter <- firstExceptT ShelleyNodeReadFileError
-      . newExceptT
-      $ readFileTextEnvelope AsOperationalCertificateIssueCounter ocertCtrPath
+    issueNumber <- firstExceptT (ShelleyNodeReadOperationalCertCounterError ocertCtrPath) $
+      readOperationalCertIssueCounter ocertCtrPath
 
     verKeyKes <- firstExceptT ShelleyNodeReadFileError
       . newExceptT
@@ -144,6 +148,9 @@ runNodeIssueOpCert (VerificationKeyFile vkeyKesPath)
     signKeyStakePool <- firstExceptT ShelleyNodeReadFileError
       . newExceptT
       $ readFileTextEnvelope (AsSigningKey AsStakePoolKey) skeyStakePoolPath
+
+    let verKeyStakePool = getVerificationKey signKeyStakePool
+        ocertIssueCounter = OperationalCertificateIssueCounter issueNumber verKeyStakePool
 
     (ocert, nextOcertCtr) <-
       firstExceptT ShelleyNodeOperationalCertificateIssueError
@@ -154,14 +161,10 @@ runNodeIssueOpCert (VerificationKeyFile vkeyKesPath)
             kesPeriod
             ocertIssueCounter
 
-    -- Write the counter first, to reduce the chance of ending up with
-    -- a new cert but without updating the counter.
-    firstExceptT ShelleyNodeWriteFileError
-      . newExceptT
-      $ writeFileTextEnvelope
-        ocertCtrPath
-        (Just $ ocertCtrDesc $ getCounter nextOcertCtr)
-        nextOcertCtr
+    firstExceptT (ShelleyNodeWriteOpCertIssueCounterError ocertCtrPath) $
+      -- Write the counter first, to reduce the chance of ending up with
+      -- a new cert but without updating the counter.
+      writeOperationalCertIssueCounter ocertCtrPath (getCounter nextOcertCtr)
 
     firstExceptT ShelleyNodeWriteFileError
       . newExceptT
@@ -169,6 +172,3 @@ runNodeIssueOpCert (VerificationKeyFile vkeyKesPath)
   where
     getCounter :: OperationalCertificateIssueCounter -> Natural
     getCounter (OperationalCertificateIssueCounter n _) = n
-
-    ocertCtrDesc :: Natural -> TextViewTitle
-    ocertCtrDesc n = TextViewTitle $ "Next certificate issue number: " <> show n

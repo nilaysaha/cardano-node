@@ -32,8 +32,7 @@ import           Control.Monad.Trans.Except.Extra (firstExceptT, handleIOExceptT
 
 import           Cardano.Api hiding (writeAddress)
 import           Cardano.Api.Typed (AsType (..), Error (..), FileError, Hash (..),
-                   OperationalCertificateIssueCounter (..), TextEnvelopeError,
-                   VerificationKey, VrfKey, castVerificationKey, generateSigningKey,
+                   TextEnvelopeError, VerificationKey, VrfKey, generateSigningKey,
                    getVerificationKey, readFileTextEnvelope, verificationKeyHash,
                    writeFileTextEnvelope)
 
@@ -189,17 +188,12 @@ runGenesisKeyGenDelegate (VerificationKeyFile vkeyPath)
     firstExceptT ShelleyGenesisCmdWriteFileError
       . newExceptT
       $ writeFileTextEnvelope vkeyPath (Just vkeyDesc) vkey
-    firstExceptT ShelleyGenesisCmdWriteFileError
-      . newExceptT
-      $ writeFileTextEnvelope ocertCtrPath (Just ocertCtrDesc)
-      $ OperationalCertificateIssueCounter
-          initialCounter
-          (castVerificationKey vkey)  -- Cast to a 'StakePoolKey'
+    firstExceptT (ShelleyGenesisCmdWriteOperationalCertError ocertCtrPath) $
+      writeOperationalCertIssueCounter ocertCtrPath initialCounter
   where
-    skeyDesc, vkeyDesc, ocertCtrDesc :: TextViewTitle
+    skeyDesc, vkeyDesc :: TextViewTitle
     skeyDesc = TextViewTitle "Genesis delegate operator key"
     vkeyDesc = TextViewTitle "Genesis delegate operator key"
-    ocertCtrDesc = TextViewTitle $ "Next certificate issue number: " <> show initialCounter
 
     initialCounter :: Natural
     initialCounter = 0
